@@ -1,0 +1,131 @@
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow.keras import layers, Model
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+
+# ---------------------------------------------------------
+# 1. Generate a synthetic multivariate time series dataset
+# ---------------------------------------------------------
+np.random.seed(42)
+T = 2000
+time = np.arange(T)
+
+series1 = 0.05 * time + 10 * np.sin(2 * np.pi * time / 50) + np.random.normal(0, 1, T)
+series2 = 0.03 * time + 5 * np.sin(2 * np.pi * time / 30) + np.random.normal(0, 1, T)
+series3 = 0.02 * time + 7 * np.sin(2 * np.pi * time / 70) + np.random.normal(0, 1, T)
+
+df = pd.DataFrame({
+    "feature1": series1,
+    "feature2": series2,
+    "feature3": series3,
+})
+
+target = df["feature1"]
+
+# ---------------------------------------------------------
+# 2. Scaling + create windows
+# ---------------------------------------------------------
+scaler = MinMaxScaler()
+scaled = scaler.fit_transform(df)
+
+def create_windows(data, targets, lookback=50, horizon=1):
+    X, y = [], []
+    for i in range(len(data) - lookback - horizon):
+        X.append(data[i:i+lookback])
+        y.append(targets[i+lookback+horizon-1])
+    return np.array(X), np.array(y)
+
+LOOKBACK = 50
+HORIZON = 1
+
+X, y = create_windows(scaled, target.values, LOOKBACK, HORIZON)
+X.shape, y.shape
+
+# ---------------------------------------------------------
+# 3. Build LSTM + Attention Model
+# ---------------------------------------------------------
+class AttentionModel(Model):
+    def __init__(self):
+        super().__init__()
+        self.lstm = layers.LSTM(64, return_sequences=True)
+        self.attention = layers.MultiHeadAttention(num_heads=4, key_dim=16)
+        self.flatten = layers.Flatten()
+        self.d1 = layers.Dense(64, activation='relu')
+        self.out = layers.Dense(1)
+
+    def call(self, x):
+        x = self.lstm(x)
+        attn_output = self.attention(x, x)
+        x = self.flatten(attn_output)
+        x = self.d1(x)
+        return self.out(x)
+
+model = AttentionModel()
+model.compile(optimizer="adam", loss="mse")
+
+# ---------------------------------------------------------
+# 4. Rolling Window Backtesting
+# ---------------------------------------------------------
+FOLDS = 5
+fold_size = len(X) // FOLDS
+
+deep_metrics = []
+baseline_metrics = []
+
+def compute_metrics(true, pred):
+    return {
+        "MAE": mean_absolute_error(true, pred),
+        "RMSE": np.sqrt(mean_squared_error(true, pred)),
+        "MAPE": np.mean(np.abs((true - pred)/true)) * 100
+    }
+
+for fold in range(FOLDS):
+    print(f"Fold {fold+1}/{FOLDS}")
+
+    end_train = (fold + 1) * fold_size
+    X_train, y_train = X[:end_train], y[:end_train]
+    X_test, y_test = X[end_train:end_train+100], y[end_train:end_train+100]
+
+    # ---- Deep Model ----
+    model = AttentionModel()
+    model.compile(optimizer="adam", loss="mse")
+    model.fit(X_train, y_train, epochs=10, batch_size=32, verbose=0)
+
+    preds = model.predict(X_test).flatten()
+    deep_metrics.append(compute_metrics(y_test, preds))
+
+    # ---- Baseline SARIMAX ----
+    try:
+        sarimax = sm.tsa.statespace.SARIMAX(y_train, order=(2,1,2))
+        res = sarimax.fit(disp=False)
+        baseline_pred = res.forecast(steps=len(y_test))
+        baseline_metrics.append(compute_metrics(y_test, baseline_pred))
+    except:
+        baseline_metrics.append({"MAE": None, "RMSE": None, "MAPE": None})
+
+# ---------------------------------------------------------
+# 5. Extract and interpret attention weights
+# ---------------------------------------------------------
+extract_model = Model(
+    inputs=model.input,
+    outputs=model.attention(model.lstm(model.input), model.lstm(model.input), return_attention_scores=True)[1]
+)
+
+sample_attn = extract_model.predict(X[:1])
+attention_matrix = sample_attn[0]
+
+print("Attention matrix shape:", attention_matrix.shape)
+
+# ---------------------------------------------------------
+# 6. Attention Interpretation
+# ---------------------------------------------------------
+time_importance = attention_matrix.mean(axis=0)
+plt.plot(time_importance)
+plt.title("Average Attention Across Time Steps")
+plt.show()
+
+print("Highest-weighted time step:", np.argmax(time_importance))
